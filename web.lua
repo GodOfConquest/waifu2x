@@ -1,37 +1,43 @@
-local ROOT = '/home/ubuntu/waifu2x'
-
-_G.TURBO_SSL = true -- Enable SSL
+_G.TURBO_SSL = true
 local turbo = require 'turbo'
 local uuid = require 'uuid'
 local ffi = require 'ffi'
 local md5 = require 'md5'
-require 'torch'
-require 'cudnn'
 require 'pl'
+require './lib/portable'
+require './lib/LeakyReLU'
 
+local cmd = torch.CmdLine()
+cmd:text()
+cmd:text("waifu2x-api")
+cmd:text("Options:")
+cmd:option("-port", 8812, 'listen port')
+cmd:option("-gpu", 1, 'Device ID')
+cmd:option("-core", 2, 'number of CPU cores')
+local opt = cmd:parse(arg)
+cutorch.setDevice(opt.gpu)
 torch.setdefaulttensortype('torch.FloatTensor')
-torch.setnumthreads(4)
+torch.setnumthreads(opt.core)
 
-package.path = package.path .. ";" .. path.join(ROOT, 'lib', '?.lua')
+local iproc = require './lib/iproc'
+local reconstruct = require './lib/reconstruct'
+local image_loader = require './lib/image_loader'
 
-require 'LeakyReLU'
-local iproc = require 'iproc'
-local reconstruct = require 'reconstruct'
-local image_loader = require 'image_loader'
+local MODEL_DIR = "./models/anime_style_art_rgb"
 
-local noise1_model = torch.load(path.join(ROOT, "models", "noise1_model.t7"), "ascii")
-local noise2_model = torch.load(path.join(ROOT, "models", "noise2_model.t7"), "ascii")
-local scale20_model = torch.load(path.join(ROOT, "models", "scale2.0x_model.t7"), "ascii")
+local noise1_model = torch.load(path.join(MODEL_DIR, "noise1_model.t7"), "ascii")
+local noise2_model = torch.load(path.join(MODEL_DIR, "noise2_model.t7"), "ascii")
+local scale20_model = torch.load(path.join(MODEL_DIR, "scale2.0x_model.t7"), "ascii")
 
 local USE_CACHE = true
-local CACHE_DIR = path.join(ROOT, "cache")
+local CACHE_DIR = "./cache"
 local MAX_NOISE_IMAGE = 2560 * 2560
 local MAX_SCALE_IMAGE = 1280 * 1280
 local CURL_OPTIONS = {
-   request_timeout = 10,
-   connect_timeout = 5,
+   request_timeout = 15,
+   connect_timeout = 10,
    allow_redirects = true,
-   max_redirects = 1
+   max_redirects = 2
 }
 local CURL_MAX_SIZE = 2 * 1024 * 1024
 local BLOCK_OFFSET = 7 -- see srcnn.lua
@@ -49,10 +55,10 @@ local function get_image(req)
    local url = req:get_argument("url", "")
    local blob = nil
    local img = nil
-   
+   local alpha = nil
    if file and file:len() > 0 then
       blob = file
-      img = image_loader.decode_float(blob)
+      img, alpha = image_loader.decode_float(blob)
    elseif url and url:len() > 0 then
       local res = coroutine.yield(
 	 turbo.async.HTTPClient({verify_ca=false},
@@ -66,11 +72,11 @@ local function get_image(req)
 	 end
 	 if content_type and content_type:find("image") then
 	    blob = res.body
-	    img = image_loader.decode_float(blob)
+	    img, alpha = image_loader.decode_float(blob)
 	 end
       end
    end
-   return img, blob
+   return img, blob, alpha
 end
 
 local function apply_denoise1(x)
@@ -106,7 +112,7 @@ function APIHandler:post()
       self:write("client disconnected")
       return
    end
-   local x, src = get_image(self)
+   local x, src, alpha = get_image(self)
    local scale = tonumber(self:get_argument("scale", "0"))
    local noise = tonumber(self:get_argument("noise", "0"))
    if x and valid_size(x, scale) then
@@ -153,7 +159,7 @@ function APIHandler:post()
 	 end
       end
       local name = uuid() .. ".png"
-      local blob, len = image_loader.encode_png(x)
+      local blob, len = image_loader.encode_png(x, alpha)
       
       self:set_header("Content-Disposition", string.format('filename="%s"', name))
       self:set_header("Content-Type", "image/png")
@@ -171,8 +177,8 @@ function APIHandler:post()
    collectgarbage()
 end
 local FormHandler = class("FormHandler", turbo.web.RequestHandler)
-local index_ja = file.read(path.join(ROOT, "assets/index.ja.html"))
-local index_en = file.read(path.join(ROOT, "assets/index.html"))
+local index_ja = file.read("./assets/index.ja.html")
+local index_en = file.read("./assets/index.html")
 function FormHandler:get()
    local lang = self.request.headers:get("Accept-Language")
    if lang then
@@ -189,14 +195,21 @@ function FormHandler:get()
       self:write(index_en)
    end
 end
-
+turbo.log.categories = {
+   ["success"] = true,
+   ["notice"] = false,
+   ["warning"] = true,
+   ["error"] = true,
+   ["debug"] = false,
+   ["development"] = false
+}
 local app = turbo.web.Application:new(
    {
       {"^/$", FormHandler},
-      {"^/index.html", turbo.web.StaticFileHandler, path.join(ROOT, "assets", "index.html")},
-      {"^/index.ja.html", turbo.web.StaticFileHandler, path.join(ROOT, "assets", "index.ja.html")},
+      {"^/index.html", turbo.web.StaticFileHandler, path.join("./assets", "index.html")},
+      {"^/index.ja.html", turbo.web.StaticFileHandler, path.join("./assets", "index.ja.html")},
       {"^/api$", APIHandler},
    }
 )
-app:listen(8812, "0.0.0.0", {max_body_size = CURL_MAX_SIZE})
+app:listen(opt.port, "0.0.0.0", {max_body_size = CURL_MAX_SIZE})
 turbo.ioloop.instance():start()
